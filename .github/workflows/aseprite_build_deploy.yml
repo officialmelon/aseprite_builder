@@ -25,7 +25,7 @@ jobs:
       should_build: ${{ steps.should_build.outputs.should_build }}
 
     steps:
-      - name: Get latest version info
+      - name: Get latest Aseprite release info
         id: version_info
         shell: bash
         run: |
@@ -33,11 +33,29 @@ jobs:
 
           LATEST_TAG=$(echo "$data" | jq -r '.tag_name')
           DOWNLOAD_URL=$(echo "$data" | jq -r '.zipball_url')
+          VERSION_BODY=$(echo "$data" | jq -r '.body // ""')
+
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "Failed to get latest Aseprite tag"
+            echo "$data"
+            exit 1
+          fi
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" = "null" ]; then
+            echo "Failed to get Aseprite zipball URL"
+            echo "$data"
+            exit 1
+          fi
 
           echo "$LATEST_TAG" > latest-version.txt
 
-          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
-          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          {
+            echo "latest_tag=$LATEST_TAG"
+            echo "download_url=$DOWNLOAD_URL"
+            echo "version_body<<EOF"
+            echo "$VERSION_BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check version cache
         id: version_check
@@ -53,8 +71,10 @@ jobs:
         run: |
           if [ "${{ steps.version_check.outputs.cache-hit }}" = "true" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Already built ${{ steps.version_info.outputs.latest_tag }}"
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Need to build ${{ steps.version_info.outputs.latest_tag }}"
           fi
 
   build-aseprite:
@@ -65,11 +85,12 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Install Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v1
-
-      - name: Setup Visual Studio environment
-        uses: seanmiddleditch/gha-setup-vsdevenv@v1
+      - name: Install build tools
+        shell: powershell
+        run: |
+          choco install ninja -y
+          echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          ninja --version
 
       - name: Get Skia from cache
         id: skia-cache
@@ -91,41 +112,52 @@ jobs:
           curl -o Aseprite-source.zip -L "${{ needs.check-version.outputs.download_url }}"
           unzip Aseprite-source.zip -d aseprite-src
 
-          # GitHub zipball extracts into aseprite-aseprite-<commit>, so normalize it.
-          mv aseprite-src/* aseprite
+          mkdir aseprite
+          shopt -s dotglob
+          mv aseprite-src/*/* aseprite/
 
           mkdir -p aseprite/build
 
-      - name: Run CMake
+      - name: Configure with CMake
         working-directory: aseprite/build
         shell: cmd
-        run: >
-          cmake
-          -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}
-          -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/"
-          -DLAF_BACKEND=skia
-          -DSKIA_DIR=../../skia
-          -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64
-          -G Ninja
-          ..
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+
+          cmake ^
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ^
+            -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/" ^
+            -DLAF_BACKEND=skia ^
+            -DSKIA_DIR=../../skia ^
+            -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 ^
+            -G Ninja ^
+            ..
 
       - name: Build Aseprite
         working-directory: aseprite/build
-        run: ninja aseprite
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
+          ninja aseprite
 
-      - name: Clean up build
+      - name: Clean up build files
         working-directory: aseprite/build/bin
         shell: bash
         run: |
-          rm -f gen modp_b64_gen gen.exe gen.exe.manifest modp_b64_gen.exe modp_b64_gen.exe.manifest
+          rm -f gen
+          rm -f modp_b64_gen
+          rm -f gen.exe
+          rm -f gen.exe.manifest
+          rm -f modp_b64_gen.exe
+          rm -f modp_b64_gen.exe.manifest
 
-      - name: Make portable zip marker
+      - name: Make portable build
         working-directory: aseprite/build/bin
         shell: bash
         run: |
           echo "# This file is here so Aseprite behaves as a portable program" > aseprite.ini
 
-      - name: Package release
+      - name: Package release zip
         working-directory: aseprite/build/bin
         shell: bash
         run: |
