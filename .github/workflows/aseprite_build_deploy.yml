@@ -3,16 +3,30 @@ name: Build and deploy Aseprite
 on:
   schedule:
     - cron: '0 0 * * *'
+
   push:
     branches:
       - master
+
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if release already exists'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 permissions:
   contents: write
 
 env:
-  BUILD_TYPE: Release
+  BUILD_TYPE: RelWithDebInfo
+  SKIA_VERSION: m124-08a5439a6b
+  SKIA_ZIP: Skia-Windows-Release-x64.zip
+  SKIA_URL: https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
 
 jobs:
   check-version:
@@ -33,7 +47,6 @@ jobs:
 
           LATEST_TAG=$(echo "$data" | jq -r '.tag_name')
           DOWNLOAD_URL=$(echo "$data" | jq -r '.zipball_url')
-          VERSION_BODY=$(echo "$data" | jq -r '.body // ""')
 
           if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
             echo "Failed to get latest Aseprite tag"
@@ -47,34 +60,43 @@ jobs:
             exit 1
           fi
 
-          echo "$LATEST_TAG" > latest-version.txt
+          echo "Latest Aseprite tag: $LATEST_TAG"
+          echo "Download URL: $DOWNLOAD_URL"
 
-          {
-            echo "latest_tag=$LATEST_TAG"
-            echo "download_url=$DOWNLOAD_URL"
-            echo "version_body<<EOF"
-            echo "$VERSION_BODY"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Check version cache
-        id: version_check
-        uses: actions/cache@v4
-        with:
-          path: latest-version.txt
-          key: aseprite-version-${{ steps.version_info.outputs.latest_tag }}
-          lookup-only: true
+      - name: Check if our release already exists
+        id: release_check
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.version_info.outputs.latest_tag }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release_exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists."
+          else
+            echo "release_exists=false" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG does not exist yet."
+          fi
 
       - name: Should we start new build?
         id: should_build
         shell: bash
+        env:
+          FORCE_BUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_build == 'true' }}
         run: |
-          if [ "${{ steps.version_check.outputs.cache-hit }}" = "true" ]; then
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Force build enabled."
+          elif [ "${{ steps.release_check.outputs.release_exists }}" = "true" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "Already built ${{ steps.version_info.outputs.latest_tag }}"
+            echo "Skipping build because release already exists."
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "Need to build ${{ steps.version_info.outputs.latest_tag }}"
+            echo "Starting build."
           fi
 
   build-aseprite:
@@ -90,26 +112,31 @@ jobs:
         run: |
           choco install ninja -y
           echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          ninja --version
 
-      - name: Get Skia from cache
+          ninja --version
+          cmake --version
+
+      - name: Restore Skia cache
         id: skia-cache
         uses: actions/cache@v4
         with:
           path: skia
-          key: skia-windows-m81-b607b32047
+          key: skia-windows-${{ env.SKIA_VERSION }}
 
-      - name: Download Skia if not in cache
+      - name: Download Skia if not cached
         if: steps.skia-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          curl -o Skia-Windows-Release-X64.zip -L https://github.com/aseprite/skia/releases/download/m81-b607b32047/Skia-Windows-Release-X64.zip
-          unzip Skia-Windows-Release-X64.zip -d skia
+          curl -L -o "${{ env.SKIA_ZIP }}" "${{ env.SKIA_URL }}"
+          unzip "${{ env.SKIA_ZIP }}" -d skia
+
+          echo "Skia directory:"
+          find skia -maxdepth 3 -type f | head -50
 
       - name: Download Aseprite source
         shell: bash
         run: |
-          curl -o Aseprite-source.zip -L "${{ needs.check-version.outputs.download_url }}"
+          curl -L -o Aseprite-source.zip "${{ needs.check-version.outputs.download_url }}"
           unzip Aseprite-source.zip -d aseprite-src
 
           mkdir aseprite
@@ -117,6 +144,9 @@ jobs:
           mv aseprite-src/*/* aseprite/
 
           mkdir -p aseprite/build
+
+          echo "Aseprite source directory:"
+          ls -la aseprite | head
 
       - name: Configure with CMake
         working-directory: aseprite/build
@@ -126,10 +156,11 @@ jobs:
 
           cmake ^
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} ^
-            -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/" ^
+            -DCMAKE_IGNORE_PATH="C:/ProgramData/chocolatey/bin/;C:/Strawberry/c/bin/;C:/msys64/mingw64/bin/;C:/msys64/usr/bin/" ^
             -DLAF_BACKEND=skia ^
             -DSKIA_DIR=../../skia ^
             -DSKIA_LIBRARY_DIR=../../skia/out/Release-x64 ^
+            -DSKIA_LIBRARY=../../skia/out/Release-x64/skia.lib ^
             -G Ninja ^
             ..
 
@@ -140,7 +171,7 @@ jobs:
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
           ninja aseprite
 
-      - name: Clean up build files
+      - name: Clean up helper build files
         working-directory: aseprite/build/bin
         shell: bash
         run: |
@@ -170,6 +201,7 @@ jobs:
           name: Release Aseprite ${{ needs.check-version.outputs.latest_tag }}
           draft: true
           prerelease: false
+          fail_on_unmatched_files: true
           files: aseprite/build/bin/Aseprite-${{ needs.check-version.outputs.latest_tag }}-Windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
